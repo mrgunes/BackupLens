@@ -17,10 +17,51 @@ import os
 import plistlib
 import platform
 import shutil
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 
 __version__ = "1.0.0"
 APP_NAME = "BackupLens"
+
+
+class PlainBackup:
+    """Read-only access to a non-encrypted iOS backup.
+
+    Mirrors the subset of EncryptedBackup's interface used by this app
+    (manifest_db_cursor / extract_file) so callers don't need to branch
+    on whether a backup is encrypted.
+    """
+
+    def __init__(self, *, backup_directory):
+        self._backup_directory = backup_directory
+        _manifest_db_path = os.path.expanduser(os.path.join(backup_directory, "Manifest.db"))
+        self._manifest_db_uri = f"file:{_manifest_db_path}?mode=ro&immutable=1"
+
+
+    @contextmanager
+    def manifest_db_cursor(self):
+        conn = sqlite3.connect(self._manifest_db_uri, uri=True)
+        try:
+            cur = conn.cursor()
+            yield cur
+            cur.close()
+        finally:
+            conn.close()
+
+    def extract_file(self, *, relative_path, domain, output_filename):
+        with self.manifest_db_cursor() as cur:
+            cur.execute(
+                "SELECT fileID FROM Files WHERE relativePath=? AND domain=? "
+                "AND flags=1 LIMIT 1",
+                (relative_path, domain),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise FileNotFoundError(relative_path)
+        file_id = row[0]
+        src = os.path.join(self._backup_directory, file_id[:2], file_id)
+        shutil.copy2(src, output_filename)
 
 
 class BackupLens:
@@ -160,19 +201,20 @@ class BackupLens:
 
         row2 = ttk.Frame(conn_frame)
         row2.pack(fill="x", pady=3)
-        ttk.Label(row2, text="Password:").pack(side="left")
+        ttk.Label(row2, text="Password (if encrypted):").pack(side="left")
         self.pass_var = tk.StringVar()
         self.pass_entry = ttk.Entry(row2, textvariable=self.pass_var,
                                      show="*", width=40)
         self.pass_entry.pack(side="left", padx=8)
         self.pass_entry.bind("<Return>", lambda e: self._decrypt())
 
-        self.decrypt_btn = ttk.Button(row2, text="Decrypt & Open",
+        self.decrypt_btn = ttk.Button(row2, text="Open Backup",
                                        command=self._decrypt, style="Safe.TButton")
         self.decrypt_btn.pack(side="left", padx=8)
 
         self.status_var = tk.StringVar(
-            value="Select a backup folder and enter your password to begin."
+            value="Select a backup folder to begin. Enter a password "
+                  "only if the backup is encrypted."
         )
         status_bar = ttk.Label(conn_frame, textvariable=self.status_var,
                                 style="Status.TLabel")
@@ -213,6 +255,8 @@ class BackupLens:
                     command=self._extract_selected).pack(side="right", padx=6)
         ttk.Button(toolbar, text="Extract All in View",
                     command=self._extract_all_view).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="Extract Entire Backup",
+                    command=self._extract_full_backup).pack(side="right", padx=6)
 
         cols = ("domain", "path", "size", "modified")
         self.file_tree = ttk.Treeview(right_frame, columns=cols,
@@ -268,6 +312,19 @@ class BackupLens:
 
     # ── Decryption ───────────────────────────────────────────
 
+    @staticmethod
+    def _is_backup_encrypted(backup_dir):
+        """Inspect Manifest.plist to determine if the backup is encrypted."""
+        manifest_plist_path = os.path.join(backup_dir, "Manifest.plist")
+        try:
+            with open(manifest_plist_path, "rb") as f:
+                manifest = plistlib.load(f)
+            return bool(manifest.get("IsEncrypted", False))
+        except Exception:
+            # If we can't tell, assume encrypted so the user isn't
+            # silently handed a decryption failure with no explanation.
+            return True
+
     def _decrypt(self):
         backup_dir = self.path_var.get().strip()
         passphrase = self.pass_var.get().strip()
@@ -275,43 +332,57 @@ class BackupLens:
         if not backup_dir or not os.path.isdir(backup_dir):
             messagebox.showerror("Error", "Please select a valid backup folder.")
             return
-        if not passphrase:
-            messagebox.showerror("Error",
-                                  "Please enter the backup encryption password.")
+
+        encrypted = self._is_backup_encrypted(backup_dir)
+        if encrypted and not passphrase:
+            messagebox.showerror(
+                "Error",
+                "This backup is encrypted. Please enter the backup "
+                "encryption password.",
+            )
             return
 
         self.decrypt_btn.configure(state="disabled")
-        self.status_var.set("Decrypting... this may take a moment.")
+        self.status_var.set(
+            "Decrypting... this may take a moment." if encrypted
+            else "Opening backup..."
+        )
         self.root.update_idletasks()
 
         threading.Thread(target=self._decrypt_thread,
-                          args=(backup_dir, passphrase), daemon=True).start()
+                          args=(backup_dir, passphrase, encrypted),
+                          daemon=True).start()
 
     def _query_manifest(self, callback, *args):
         """Execute a callback with a manifest DB cursor (context-managed)."""
         with self.backup.manifest_db_cursor() as cur:
             return callback(cur, *args)
 
-    def _decrypt_thread(self, backup_dir, passphrase):
-        try:
-            from iphone_backup_decrypt import EncryptedBackup
-        except ImportError:
-            self.root.after(0, lambda: (
-                self.decrypt_btn.configure(state="normal"),
-                messagebox.showerror(
-                    "Missing Dependency",
-                    "The 'iphone_backup_decrypt' package is required.\n\n"
-                    "Install it by running:\n"
-                    "  pip install iphone_backup_decrypt",
-                ),
-                self.status_var.set("Missing dependency. See error above."),
-            ))
-            return
+    def _decrypt_thread(self, backup_dir, passphrase, encrypted):
+        if encrypted:
+            try:
+                from iphone_backup_decrypt import EncryptedBackup
+            except ImportError:
+                self.root.after(0, lambda: (
+                    self.decrypt_btn.configure(state="normal"),
+                    messagebox.showerror(
+                        "Missing Dependency",
+                        "The 'iphone_backup_decrypt' package is required "
+                        "for encrypted backups.\n\n"
+                        "Install it by running:\n"
+                        "  pip install iphone_backup_decrypt",
+                    ),
+                    self.status_var.set("Missing dependency. See error above."),
+                ))
+                return
 
         try:
-            self.backup = EncryptedBackup(
-                backup_directory=backup_dir, passphrase=passphrase
-            )
+            if encrypted:
+                self.backup = EncryptedBackup(
+                    backup_directory=backup_dir, passphrase=passphrase
+                )
+            else:
+                self.backup = PlainBackup(backup_directory=backup_dir)
             self.backup_dir = backup_dir
             # Clear password from the UI after successful decryption
             self.root.after(0, lambda: self.pass_var.set(""))
@@ -338,7 +409,7 @@ class BackupLens:
     def _on_decrypt_success(self, domains, total_files):
         self.decrypt_btn.configure(state="normal")
         self.status_var.set(
-            f"Decrypted! {total_files:,} files across {len(domains)} domains."
+            f"Loaded! {total_files:,} files across {len(domains)} domains."
         )
         self.domain_tree.delete(*self.domain_tree.get_children())
 
@@ -619,6 +690,120 @@ class BackupLens:
             msg += f" ({skipped} skipped)"
         self.root.after(0, lambda: self.status_var.set(msg))
         self.root.after(0, lambda: messagebox.showinfo("Done", msg))
+
+    def _extract_full_backup(self):
+        """Extract every file in the backup, preserving domain/relativePath.
+
+        Unlike Extract Selected / Extract All in View, this reads straight
+        from the manifest instead of the (10,000-row-capped) UI file list,
+        so nothing is left out for large backups.
+        """
+        if not self.backup:
+            messagebox.showinfo("Info", "Open a backup first.")
+            return
+        dest = filedialog.askdirectory(
+            title="Select Output Folder for Full Backup Extraction"
+        )
+        if not dest:
+            return
+        if not messagebox.askyesno(
+            "Confirm",
+            "This will extract every file in the backup into "
+            "domain/relativePath folders (e.g. "
+            "HomeDomain/Library/SMS/sms.db), matching the layout tools "
+            "like iphone-backup-tools expect. This may take a while and "
+            "use significant disk space. Continue?",
+        ):
+            return
+        self.status_var.set("Extracting entire backup...")
+        self.root.update_idletasks()
+        threading.Thread(target=self._extract_full_thread, args=(dest,),
+                          daemon=True).start()
+
+    def _extract_full_thread(self, dest):
+        real_dest = os.path.realpath(dest)
+
+        try:
+            with self.backup.manifest_db_cursor() as cur:
+                cur.execute(
+                    "SELECT fileID, domain, relativePath FROM Files "
+                    "WHERE flags=1"
+                )
+                rows = cur.fetchall()
+        except Exception as e:
+            self.root.after(0, lambda: self.status_var.set(f"Error: {e}"))
+            self.root.after(0, lambda: messagebox.showerror(
+                "Error", f"Failed to read backup manifest:\n{e}"
+            ))
+            return
+
+        total = len(rows)
+        extracted = 0
+        errors = 0
+        skipped = 0
+
+        for i, (file_id, domain, rel_path) in enumerate(rows, start=1):
+            try:
+                if not rel_path:
+                    skipped += 1
+                    continue
+
+                out_path = os.path.join(dest, domain, rel_path)
+
+                # Path traversal protection — ensure output stays inside dest
+                real_out = os.path.realpath(out_path)
+                if not real_out.startswith(real_dest + os.sep):
+                    skipped += 1
+                    continue
+
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+                try:
+                    self.backup.extract_file(
+                        relative_path=rel_path, domain=domain,
+                        output_filename=out_path,
+                    )
+                    extracted += 1
+                except Exception:
+                    src = os.path.join(self.backup_dir, file_id[:2], file_id)
+                    if os.path.exists(src):
+                        shutil.copy2(src, out_path)
+                        extracted += 1
+                    else:
+                        errors += 1
+            except Exception:
+                errors += 1
+
+            if i % 200 == 0 or i == total:
+                done = i
+                self.root.after(0, lambda d=done, t=total: self.status_var.set(
+                    f"Extracting entire backup... {d:,}/{t:,} files"
+                ))
+
+        msg = f"Extracted {extracted:,} of {total:,} files to {dest}"
+        if errors:
+            msg += f" ({errors} errors)"
+        if skipped:
+            msg += f" ({skipped} skipped)"
+
+        sms_path = os.path.join(dest, "HomeDomain", "Library", "SMS", "sms.db")
+        addr_path = os.path.join(
+            dest, "HomeDomain", "Library", "AddressBook", "AddressBook.sqlitedb"
+        )
+        if os.path.exists(sms_path):
+            msg += (
+                "\n\nTo browse messages with iphone-backup-tools:\n"
+                f'  python message_viewer.py "{sms_path}"'
+            )
+            if os.path.exists(addr_path):
+                msg += f' --addressbook "{addr_path}"'
+
+        self.root.after(0, lambda: self.status_var.set(
+            f"Extracted {extracted:,} of {total:,} files to {dest}"
+        ))
+        self.root.after(0, lambda: messagebox.showinfo(
+            "Extraction Complete", msg
+        ))
 
     # ── Helpers ──────────────────────────────────────────────
 
