@@ -13,13 +13,13 @@ https://github.com/mrgunes/BackupLens
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import queue
 import os
 import plistlib
 import platform
-import shutil
 from datetime import datetime
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "BackupLens"
 
 
@@ -46,9 +46,27 @@ class BackupLens:
         self.backup_dir = None
         self.file_list = []
 
+        # iphone_backup_decrypt's SQLite connection is thread-bound. Run every
+        # backup operation on one worker so listing and extract don't fail.
+        self._jobs = queue.Queue()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+
         self._apply_style()
         self._build_ui()
         self._auto_detect_backup()
+
+    def _worker_loop(self):
+        while True:
+            fn, args = self._jobs.get()
+            try:
+                fn(*args)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda m=msg: self.status_var.set(f"Error: {m}"))
+
+    def _submit(self, fn, *args):
+        """Run a backup operation on the worker thread."""
+        self._jobs.put((fn, args))
 
     # ── Theming ──────────────────────────────────────────────
 
@@ -241,19 +259,28 @@ class BackupLens:
     def _auto_detect_backup(self):
         system = platform.system()
         base = self.BACKUP_PATHS.get(system)
-        if base and os.path.isdir(base):
+        if not (base and os.path.isdir(base)):
+            return
+        try:
             subs = [
                 os.path.join(base, d) for d in os.listdir(base)
                 if os.path.isdir(os.path.join(base, d))
             ]
-            if subs:
-                # Pick the most recently modified backup
-                subs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                self.path_var.set(subs[0])
-                self.status_var.set(
-                    f"Auto-detected backup: {os.path.basename(subs[0])}. "
-                    "Enter your password to decrypt."
-                )
+        except PermissionError:
+            self.status_var.set(
+                "macOS is blocking automatic backup detection. "
+                "Click Browse and select the backup folder "
+                "(the long hex name inside MobileSync/Backup)."
+            )
+            return
+        if subs:
+            # Pick the most recently modified backup
+            subs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            self.path_var.set(subs[0])
+            self.status_var.set(
+                f"Auto-detected backup: {os.path.basename(subs[0])}. "
+                "Enter your password to decrypt."
+            )
 
     # ── Folder browser ───────────────────────────────────────
 
@@ -284,8 +311,7 @@ class BackupLens:
         self.status_var.set("Decrypting... this may take a moment.")
         self.root.update_idletasks()
 
-        threading.Thread(target=self._decrypt_thread,
-                          args=(backup_dir, passphrase), daemon=True).start()
+        self._submit(self._decrypt_thread, backup_dir, passphrase)
 
     def _query_manifest(self, callback, *args):
         """Execute a callback with a manifest DB cursor (context-managed)."""
@@ -412,8 +438,7 @@ class BackupLens:
             return
         self.status_var.set("Loading files...")
         self.root.update_idletasks()
-        threading.Thread(target=self._load_files, args=(sel[0],),
-                          daemon=True).start()
+        self._submit(self._load_files, sel[0])
 
     def _load_files(self, selected):
         try:
@@ -450,8 +475,7 @@ class BackupLens:
             return
         domains = list(children)
         placeholders = ",".join("?" * len(domains))
-        threading.Thread(target=self._query_domains,
-                          args=(domains, placeholders), daemon=True).start()
+        self._submit(self._query_domains, domains, placeholders)
 
     def _query_domains(self, domains, placeholders):
         try:
@@ -562,17 +586,21 @@ class BackupLens:
             return
         self.status_var.set(f"Extracting {len(file_ids)} files...")
         self.root.update_idletasks()
-        threading.Thread(target=self._extract_thread,
-                          args=(file_ids, dest), daemon=True).start()
+        self._submit(self._extract_thread, file_ids, dest)
 
     def _extract_thread(self, file_ids, dest):
         extracted = 0
         errors = 0
         skipped = 0
+        first_error = None
         real_dest = os.path.realpath(dest)
 
-        # Build lookup dict for O(1) access
-        lookup = {fd[0]: fd for fd in self.file_list}
+        # Key by fileID and by the tree iid used for duplicate fileIDs
+        lookup = {}
+        for fd in self.file_list:
+            file_id, domain, rel_path, _, _ = fd
+            lookup[file_id] = fd
+            lookup[f"{file_id}_{domain}_{rel_path}"] = fd
 
         for fid in file_ids:
             try:
@@ -597,27 +625,32 @@ class BackupLens:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
                 try:
+                    # iphone_backup_decrypt takes domain_like, not domain.
+                    # Never copy the hashed backup blob on failure — those
+                    # files are still encrypted and look "damaged" in Preview.
                     self.backup.extract_file(
-                        relative_path=rel_path, domain=domain,
+                        relative_path=rel_path,
+                        domain_like=domain,
                         output_filename=out_path,
                     )
                     extracted += 1
-                except Exception:
-                    src = os.path.join(self.backup_dir, file_id[:2], file_id)
-                    if os.path.exists(src):
-                        shutil.copy2(src, out_path)
-                        extracted += 1
-                    else:
-                        errors += 1
-            except Exception:
+                except Exception as e:
+                    errors += 1
+                    if first_error is None:
+                        first_error = f"{rel_path}: {type(e).__name__}: {e}"
+            except Exception as e:
                 errors += 1
+                if first_error is None:
+                    first_error = str(e)
 
         msg = f"Extracted {extracted:,} files to {dest}"
         if errors:
             msg += f" ({errors} errors)"
         if skipped:
             msg += f" ({skipped} skipped)"
-        self.root.after(0, lambda: self.status_var.set(msg))
+        if first_error:
+            msg += f"\n\nFirst error:\n{first_error}"
+        self.root.after(0, lambda: self.status_var.set(msg.split("\n")[0]))
         self.root.after(0, lambda: messagebox.showinfo("Done", msg))
 
     # ── Helpers ──────────────────────────────────────────────

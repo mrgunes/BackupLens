@@ -74,10 +74,12 @@ cd BackupLens
 pip install -r requirements.txt
 
 # 3. Run BackupLens
-python backuplens.py
+python3 backuplens.py
 ```
 
 That's it. No build step, no Docker, no config files.
+
+On macOS with Homebrew Python, tkinter is a separate package: `brew install python-tk`. Use the same `python3` you installed the dependency with.
 
 ---
 
@@ -85,7 +87,9 @@ That's it. No build step, no Docker, no config files.
 
 ### 1. Find your backup
 
-BackupLens auto-detects your backup location. If it doesn't, here's where iTunes/Finder stores them:
+BackupLens auto-detects your backup location. If it doesn't, click **Browse** and pick the backup folder (the long hex name). On macOS, privacy protections often block listing `MobileSync/Backup` until you choose it in the file dialog — that is expected.
+
+Default locations:
 
 | Platform | Default backup location |
 |---|---|
@@ -198,6 +202,19 @@ Yes. Some files (especially app databases) may show size mismatch warnings. This
 <summary><strong>Can I use this on Linux?</strong></summary>
 
 Yes! Install `python3-tk` (`sudo apt install python3-tk` on Ubuntu/Debian) and follow the normal installation steps. You'll need to copy your backup folder from a Windows or Mac machine first.
+</details>
+
+<details>
+<summary><strong>Extracted photos won't open in Preview ("damaged" HEIC/JPG)</strong></summary>
+
+That meant the file was still encrypted. BackupLens 1.0.1 decrypts on extract instead of copying the hashed backup blob. Update and extract again into a new folder.
+</details>
+
+<details>
+<summary><strong>Auto-detect finds nothing on macOS / <code>No module named '_tkinter'</code></strong></summary>
+
+- **Empty auto-detect:** click Browse and select the backup folder yourself. macOS Full Disk Access is not required if you pick the folder in the dialog.
+- **`_tkinter`:** Homebrew Python does not include Tk. Install it with `brew install python-tk`, or run the python.org installer (it includes Tk). Use `python3 backuplens.py`, not `python`, if those are different installs.
 </details>
 
 ---
