@@ -89,7 +89,7 @@ BackupLens auto-detects your backup location. If it doesn't, here's where iTunes
 
 | Platform | Default backup location |
 |---|---|
-| **Windows** | `%APPDATA%\Apple Computer\MobileSync\Backup\` |
+| **Windows** | `%APPDATA%\Apple Computer\MobileSync\Backup\` (iTunes installer) or `%USERPROFILE%\Apple\MobileSync\Backup\` (Microsoft Store iTunes / Apple Devices app) |
 | **macOS** | `~/Library/Application Support/MobileSync/Backup/` |
 | **Linux** | Backups must be copied from a Windows/Mac machine |
 
@@ -121,7 +121,7 @@ This is the **encryption password you set in iTunes, Finder, or the Apple Device
 
 3. **No telemetry, no analytics, no tracking** — We don't know you exist. We don't want to.
 
-4. **Fully auditable** — The entire app is a single Python file (~600 lines). Read it. We encourage it.
+4. **Fully auditable** — The entire app is a single Python file (about 1,000 lines). Read it. We encourage it.
 
 5. **Open source dependencies** — Our only dependency ([iphone_backup_decrypt](https://github.com/jsharkey13/iphone_backup_decrypt)) is also open source and MIT licensed.
 
@@ -133,7 +133,7 @@ For our full security policy, see [SECURITY.md](SECURITY.md).
 
 ### Windows
 
-1. Press `Win + R`, type `%APPDATA%\Apple Computer\MobileSync\Backup`, press Enter
+1. Press `Win + R`, type `%APPDATA%\Apple Computer\MobileSync\Backup`, press Enter (or `%USERPROFILE%\Apple\MobileSync\Backup` if you installed iTunes from the Microsoft Store)
 2. Each subfolder (long alphanumeric name) is one device backup
 
 ### macOS
@@ -216,6 +216,7 @@ Please keep in mind:
 - **Security is paramount.** Any PR that adds network access will be rejected.
 - **Keep it simple.** The app should remain a single file that anyone can audit.
 - **Test on multiple platforms** if possible.
+- **Run the tests** before opening a PR: `python -m unittest discover -s tests -t .` (they build a small encrypted backup and run it through the real decryption library).
 
 ---
 
@@ -232,7 +233,7 @@ sudo lsof -i -P | grep python
 # Option 3: Monitor network activity (Windows PowerShell)
 Get-NetTCPConnection | Where-Object { $_.OwningProcess -eq (Get-Process python).Id }
 
-# Option 4: Read the source — it's one file, ~600 lines.
+# Option 4: Read the source — it's one file, about 1,000 lines.
 ```
 
 ---

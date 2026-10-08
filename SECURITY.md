@@ -15,7 +15,9 @@ BackupLens is designed from the ground up with your privacy and security as the 
 ### No Data Storage
 - Your backup password is **never saved** to disk, logs, or any file.
 - The password is discarded from the UI immediately after successful decryption and is not retained when you close the app.
-- BackupLens does not create any config files, temp files, or caches.
+- BackupLens creates no config files, logs, or caches.
+- While a backup is open, the decryption library keeps a **decrypted copy of `Manifest.db`** (the backup's file index: names, paths and wrapped per-file keys, not your file contents) in a temporary folder. It is deleted when you close the app or open a different backup. If the app is killed or crashes it may be left behind in your system temp folder, so delete stray `Manifest.db` copies there if that happens, and use full-disk encryption.
+- Files you extract are written, **decrypted**, to the folder you choose. Protect or delete them yourself.
 
 ### No Tracking
 - No usage analytics. No crash reporting. No fingerprinting.

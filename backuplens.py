@@ -12,43 +12,465 @@ https://github.com/mrgunes/BackupLens
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import concurrent.futures
+import queue
+import sys
 import threading
+import traceback
+import time
 import os
 import plistlib
 import platform
-import shutil
+import re
 from datetime import datetime
 
 __version__ = "1.0.0"
 APP_NAME = "BackupLens"
 
+# The file list shows at most this many rows. The status bar says so when
+# a query matched more, and the search box queries the whole backup.
+MAX_ROWS = 10000
+
+# Rows per "domain IN (...)" query; SQLite builds limit bound variables.
+_DOMAIN_CHUNK = 500
+
+
+# ── Helpers (no GUI) ─────────────────────────────────────────
+
+def format_size(size):
+    for unit in ("B", "KB", "MB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+        size /= 1024
+    return f"{size:.2f} GB"
+
+
+def escape_like(text):
+    """Escape SQL LIKE wildcards so *text* matches literally (ESCAPE '\\')."""
+    return (text.replace("\\", "\\\\").replace("%", "\\%")
+            .replace("_", "\\_"))
+
+
+def read_file_info(blob):
+    """Return ``(size, mtime)`` from a Manifest.db ``file`` blob.
+
+    Either value is ``None`` when it cannot be read.
+    """
+    if not blob:
+        return None, None
+    try:
+        meta = plistlib.loads(blob)
+    except Exception:
+        return None, None
+    objects = meta.get("$objects") if isinstance(meta, dict) else None
+    if not isinstance(objects, list):
+        return None, None
+
+    info = None
+    try:
+        info = objects[meta["$top"]["root"].data]
+    except (KeyError, IndexError, AttributeError, TypeError):
+        pass
+    if not isinstance(info, dict):
+        info = objects[1] if len(objects) > 1 else None
+    if not isinstance(info, dict):
+        return None, None
+
+    size = info.get("Size")
+    mtime = info.get("LastModified")
+    return (size if isinstance(size, int) else None,
+            mtime if isinstance(mtime, (int, float)) else None)
+
+
+_WINDOWS_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED = re.compile(
+    r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.IGNORECASE
+)
+
+
+class UnsafePathError(ValueError):
+    """A backup path that cannot be written safely under the output folder."""
+
+
+def sanitize_component(part, windows=None):
+    """Make one path component valid on the host file system."""
+    if windows is None:
+        windows = os.name == "nt"
+    part = part.replace("\x00", "_")
+    if not windows:
+        return part
+    part = _WINDOWS_ILLEGAL.sub("_", part)
+    if _WINDOWS_RESERVED.match(part.split(".")[0]):
+        part = "_" + part
+    if part.endswith((".", " ")):
+        part = part[:-1] + "_"
+    return part or "_"
+
+
+def build_output_path(dest, domain, relative_path, file_id="", used=None,
+                      windows=None):
+    """Return where a backup file is written: ``dest/domain/relative_path``.
+
+    Raises UnsafePathError if the path would escape *dest*. Names that
+    collide with one already written in this run (*used*, case-insensitive)
+    get the file ID appended instead of overwriting each other.
+    """
+    parts = relative_path.split("/")
+    if ".." in parts:
+        raise UnsafePathError("path contains '..'")
+    parts = [p for p in parts if p not in ("", ".")]
+    if not parts:
+        raise UnsafePathError("empty path")
+    parts = [sanitize_component(domain, windows)] + [
+        sanitize_component(p, windows) for p in parts
+    ]
+
+    real_dest = os.path.realpath(dest)
+    out_path = os.path.join(real_dest, *parts)
+    real_out = os.path.realpath(out_path)
+    try:
+        inside = os.path.commonpath(
+            [os.path.normcase(real_dest), os.path.normcase(real_out)]
+        ) == os.path.normcase(real_dest)
+    except ValueError:
+        inside = False
+    if not inside or os.path.normcase(real_out) == os.path.normcase(real_dest):
+        raise UnsafePathError("path escapes the output folder")
+
+    if used is not None:
+        key = os.path.normcase(out_path)
+        if key in used and file_id:
+            stem, ext = os.path.splitext(parts[-1])
+            parts[-1] = f"{stem}_{file_id[:8]}{ext}"
+            out_path = os.path.join(real_dest, *parts)
+            key = os.path.normcase(out_path)
+        used.add(key)
+    return out_path
+
+
+def fs_path(path):
+    """Use the Windows extended-length form for very long paths.
+
+    iOS backups contain deep paths (e.g. Notes attachments) that exceed
+    the 260 character limit once joined to the output folder.
+    """
+    if os.name != "nt":
+        return path
+    path = os.path.abspath(path)
+    if path.startswith("\\\\?\\") or len(path) < 240:
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
+
+
+def is_wrong_passphrase(exc):
+    """True if *exc* means the backup password was rejected."""
+    return (type(exc).__name__ == "IncorrectPassphraseError"
+            or (isinstance(exc, ValueError)
+                and "incorrect passphrase" in str(exc).lower()))
+
+
+class ExtractionReport:
+    """Outcome of one extraction run."""
+
+    def __init__(self):
+        self.extracted = 0
+        self.skipped = []   # (label, reason)
+        self.errors = []    # (label, reason)
+        self.cancelled = False
+
+
+def _default_backup_factory(**kwargs):
+    from iphone_backup_decrypt import EncryptedBackup
+    return EncryptedBackup(**kwargs)
+
+
+class BackupSession:
+    """Owns the opened backup and runs every call on ONE worker thread.
+
+    ``iphone_backup_decrypt`` keeps a SQLite connection to the decrypted
+    manifest, and SQLite connections may only be used on the thread that
+    created them. The public methods therefore never touch the backup
+    directly: they queue the work on a single dedicated thread and return a
+    ``concurrent.futures.Future``. That thread opens the backup, runs all
+    queries and extractions, and releases it, so the connection is always
+    used (and closed) where it was created.
+    """
+
+    def __init__(self, backup_factory=None):
+        self._factory = backup_factory or _default_backup_factory
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="backup-worker"
+        )
+        self._backup = None
+        self._cancel = threading.Event()
+        self._closed = False
+
+    # ── Public API (any thread; each returns a Future) ───────
+
+    def open(self, backup_dir, passphrase):
+        """Decrypt and open a backup. Future -> (domains, total_files)."""
+        return self._executor.submit(self._open, backup_dir, passphrase)
+
+    def query_files(self, domains=None, search="", limit=MAX_ROWS):
+        """List files. Future -> (rows, total_matching).
+
+        *domains* is a list of domains, or None for the whole backup.
+        Each row is (file_id, domain, relative_path, size_str, mod_str).
+        """
+        return self._executor.submit(self._query_files, domains, search,
+                                     limit)
+
+    def extract(self, file_ids, dest, progress=None):
+        """Decrypt files into *dest*. Future -> ExtractionReport."""
+        self._cancel.clear()
+        return self._executor.submit(self._extract, list(file_ids), dest,
+                                     progress)
+
+    def cancel_extraction(self):
+        self._cancel.set()
+
+    def close(self):
+        """Release the backup (and its temporary decrypted manifest)."""
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel.set()
+        self._executor.submit(self._discard)
+        self._executor.shutdown(wait=False)
+
+    # ── Worker-thread internals ──────────────────────────────
+
+    def _discard(self):
+        self._swap_backup(None)
+
+    def _swap_backup(self, new_backup):
+        # Dropping the last reference to the old backup runs the library's
+        # cleanup here, on the thread that owns its SQLite connection, and
+        # deletes its temporary decrypted Manifest.db.
+        old, self._backup = self._backup, new_backup
+        del old
+
+    def _require_backup(self):
+        if self._backup is None:
+            raise RuntimeError("No backup is open.")
+        return self._backup
+
+    def _open(self, backup_dir, passphrase):
+        # The previously opened backup (if any) stays usable until the new
+        # one has opened successfully.
+        backup = self._factory(backup_directory=backup_dir,
+                               passphrase=passphrase)
+        try:
+            with backup.manifest_db_cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT domain FROM Files ORDER BY domain"
+                )
+                domains = [r[0] for r in cur.fetchall() if r[0]]
+                cur.execute("SELECT COUNT(*) FROM Files WHERE flags=1")
+                total = cur.fetchone()[0]
+        except BaseException:
+            # Do not let the traceback keep the half-open backup alive
+            # past this thread.
+            backup = None
+            raise
+        self._swap_backup(backup)
+        return domains, total
+
+    def _query_files(self, domains, search, limit):
+        backup = self._require_backup()
+        if domains is not None and not domains:
+            return [], 0
+
+        where = ["flags=1"]
+        params = []
+        if search:
+            where.append("(domain LIKE ? ESCAPE '\\' "
+                         "OR relativePath LIKE ? ESCAPE '\\')")
+            pattern = "%" + escape_like(search) + "%"
+            params += [pattern, pattern]
+
+        chunks = [None] if domains is None else [
+            domains[i:i + _DOMAIN_CHUNK]
+            for i in range(0, len(domains), _DOMAIN_CHUNK)
+        ]
+        raw_rows = []
+        total = 0
+        with backup.manifest_db_cursor() as cur:
+            for chunk in chunks:
+                clauses = list(where)
+                chunk_params = list(params)
+                if chunk is not None:
+                    clauses.append(
+                        "domain IN (%s)" % ",".join("?" * len(chunk))
+                    )
+                    chunk_params += chunk
+                condition = " AND ".join(clauses)
+
+                cur.execute("SELECT COUNT(*) FROM Files WHERE " + condition,
+                            chunk_params)
+                total += cur.fetchone()[0]
+
+                remaining = limit - len(raw_rows)
+                if remaining > 0:
+                    cur.execute(
+                        "SELECT fileID, domain, relativePath, file "
+                        "FROM Files WHERE " + condition +
+                        " ORDER BY domain, relativePath LIMIT ?",
+                        chunk_params + [remaining],
+                    )
+                    raw_rows.extend(cur.fetchall())
+        return self._display_rows(raw_rows), total
+
+    @staticmethod
+    def _display_rows(raw_rows):
+        rows = []
+        for file_id, domain, rel_path, blob in raw_rows:
+            size, mtime = read_file_info(blob)
+            size_str = format_size(size) if size else ""
+            mod_str = ""
+            if mtime:
+                try:
+                    mod_str = datetime.fromtimestamp(mtime).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                except (OverflowError, OSError, ValueError):
+                    pass
+            rows.append((file_id, domain or "", rel_path or "", size_str,
+                         mod_str))
+        return rows
+
+    def _extract(self, file_ids, dest, progress):
+        backup = self._require_backup()
+        report = ExtractionReport()
+        used = set()
+        total = len(file_ids)
+        last_report = 0.0
+
+        with backup.manifest_db_cursor() as cur:
+            for n, file_id in enumerate(file_ids, 1):
+                if self._cancel.is_set():
+                    report.cancelled = True
+                    break
+                try:
+                    self._extract_one(backup, cur, file_id, dest, used,
+                                      report)
+                except Exception as exc:
+                    # Not listed in the manifest (or the manifest query
+                    # itself failed): nothing better to show than the ID.
+                    report.errors.append(
+                        (file_id, f"{type(exc).__name__}: {exc}")
+                    )
+                if progress:
+                    now = time.monotonic()
+                    if n == total or now - last_report >= 0.1:
+                        last_report = now
+                        progress(n, total)
+        return report
+
+    def _extract_one(self, backup, cur, file_id, dest, used, report):
+        cur.execute(
+            "SELECT domain, relativePath, file FROM Files "
+            "WHERE fileID=? AND flags=1", (file_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise LookupError("file is not listed in the backup manifest")
+        domain, rel_path, blob = row
+        label = f"{domain}/{rel_path}"
+        try:
+            if not domain or not rel_path:
+                raise UnsafePathError("entry has no domain or path")
+            out_path = fs_path(
+                build_output_path(dest, domain, rel_path, file_id, used)
+            )
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+            size, mtime = read_file_info(blob)
+            if size == 0:
+                # Empty files have no key and no data in the backup.
+                open(out_path, "wb").close()
+                if mtime:
+                    os.utime(out_path, (mtime, mtime))
+            else:
+                self._decrypt_to(backup, cur, file_id, domain, rel_path,
+                                 out_path)
+            report.extracted += 1
+        except UnsafePathError as exc:
+            report.skipped.append((label, str(exc)))
+        except Exception as exc:
+            report.errors.append((label, f"{type(exc).__name__}: {exc}"))
+
+    @staticmethod
+    def _decrypt_to(backup, cur, file_id, domain, rel_path, out_path):
+        # extract_file() looks the file up by relative path and a LIKE
+        # pattern on the domain, so a '_' or '%' in the domain could also
+        # match a different domain holding the same path.
+        cur.execute(
+            "SELECT COUNT(*) FROM Files "
+            "WHERE relativePath = ? AND domain LIKE ? AND flags=1",
+            (rel_path, domain),
+        )
+        if cur.fetchone()[0] <= 1:
+            backup.extract_file(relative_path=rel_path, domain_like=domain,
+                                output_filename=out_path)
+            return
+
+        # Ambiguous: pick the exact row by file ID instead.
+        def only_this_file(**kwargs):
+            return out_path if kwargs.get("file_id") == file_id else False
+
+        count = backup.extract_files(
+            relative_paths_like=rel_path, domain_like=domain,
+            output_folder=os.path.dirname(out_path),
+            filter_callback=only_this_file,
+        )
+        if count != 1:
+            raise RuntimeError("could not select this file unambiguously")
+
 
 class BackupLens:
     """Main application class for BackupLens."""
 
-    # Default backup locations by platform
+    # Where iTunes / Finder / the Apple Devices app keep local backups.
+    # Windows has two: the classic installer and the Microsoft Store app.
     BACKUP_PATHS = {
-        "Windows": os.path.expandvars(
-            r"%APPDATA%\Apple Computer\MobileSync\Backup"
-        ),
-        "Darwin": os.path.expanduser(
-            "~/Library/Application Support/MobileSync/Backup"
-        ),
+        "Windows": [
+            os.path.expandvars(r"%APPDATA%\Apple Computer\MobileSync\Backup"),
+            os.path.expandvars(r"%USERPROFILE%\Apple\MobileSync\Backup"),
+        ],
+        "Darwin": [
+            os.path.expanduser(
+                "~/Library/Application Support/MobileSync/Backup"
+            ),
+        ],
     }
 
-    def __init__(self, root):
+    def __init__(self, root, session=None):
         self.root = root
         self.root.title(f"{APP_NAME} v{__version__}")
         self.root.geometry("1200x750")
         self.root.minsize(900, 550)
 
-        self.backup = None
-        self.backup_dir = None
-        self.file_list = []
+        self.session = session or BackupSession()
+        self.backup_open = False
+        self._scope_domains = None   # None = every domain
+        self._scope_set = False
+        self._request_id = 0         # discards out-of-date file lists
+        self._search_job = None
+        self._extracting = False
+
+        # Worker threads must never call into Tk (it can hang at shutdown),
+        # so they hand work to the Tk thread through this queue.
+        self._ui_queue = queue.Queue()
+        self._poll_job = None
 
         self._apply_style()
         self._build_ui()
         self._auto_detect_backup()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._drain_ui_queue()
 
     # ── Theming ──────────────────────────────────────────────
 
@@ -138,10 +560,10 @@ class BackupLens:
         privacy_frame.pack(fill="x", padx=20, pady=(6, 0))
         privacy_lbl = tk.Label(
             privacy_frame,
-            text="  100% Offline  \u2022  No data leaves your computer  "
-                 "\u2022  Open source  \u2022  Your password is never stored  ",
+            text="  100% Offline  •  No data leaves your computer  "
+                 "•  Open source  •  Your password is never stored  ",
             bg=self.colors["green_light"], fg=self.colors["green"],
-            font=("Segoe UI", 9), padx=10, pady=4, anchor="w",
+            font=(self._system_font(), 9), padx=10, pady=4, anchor="w",
         )
         privacy_lbl.pack(fill="x")
 
@@ -203,7 +625,7 @@ class BackupLens:
         toolbar.pack(fill="x", pady=(0, 6))
         ttk.Label(toolbar, text="Search:").pack(side="left")
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *a: self._filter_files())
+        self.search_var.trace_add("write", lambda *a: self._schedule_search())
         ttk.Entry(toolbar, textvariable=self.search_var, width=35).pack(
             side="left", padx=8)
         self.count_var = tk.StringVar(value="")
@@ -236,32 +658,73 @@ class BackupLens:
         fy.pack(side="right", fill="y")
         self.file_tree.pack(side="left", fill="both", expand=True)
 
+    # ── Background work ──────────────────────────────────────
+
+    def _post(self, func, *args):
+        """Queue ``func(*args)`` to run on the Tk thread (thread-safe)."""
+        self._ui_queue.put((func, args))
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                func, args = self._ui_queue.get_nowait()
+                try:
+                    func(*args)
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+        except queue.Empty:
+            pass
+        finally:
+            self._poll_job = self.root.after(50, self._drain_ui_queue)
+
+    def _when_done(self, future, callback):
+        """Run ``callback(future)`` on the Tk thread once *future* is done."""
+        future.add_done_callback(lambda fut: self._post(callback, fut))
+
     # ── Auto-detect backup ───────────────────────────────────
 
     def _auto_detect_backup(self):
-        system = platform.system()
-        base = self.BACKUP_PATHS.get(system)
-        if base and os.path.isdir(base):
-            subs = [
-                os.path.join(base, d) for d in os.listdir(base)
-                if os.path.isdir(os.path.join(base, d))
-            ]
-            if subs:
-                # Pick the most recently modified backup
-                subs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                self.path_var.set(subs[0])
-                self.status_var.set(
-                    f"Auto-detected backup: {os.path.basename(subs[0])}. "
-                    "Enter your password to decrypt."
-                )
+        newest = None
+        blocked = False
+        for base in self.BACKUP_PATHS.get(platform.system(), []):
+            if not os.path.isdir(base):
+                continue
+            try:
+                for name in os.listdir(base):
+                    path = os.path.join(base, name)
+                    if os.path.isdir(path) and (
+                            newest is None
+                            or os.path.getmtime(path)
+                            > os.path.getmtime(newest)):
+                        newest = path
+            except OSError:
+                # macOS blocks listing MobileSync/Backup unless the user
+                # picks the folder in a file dialog.
+                blocked = True
+        if newest:
+            # Pick the most recently modified backup
+            self.path_var.set(newest)
+            self.status_var.set(
+                f"Auto-detected backup: {os.path.basename(newest)}. "
+                "Enter your password to decrypt."
+            )
+        elif blocked:
+            self.status_var.set(
+                "The operating system is blocking automatic backup "
+                "detection. Click Browse and select the backup folder "
+                "(the long hex name inside MobileSync/Backup)."
+            )
 
     # ── Folder browser ───────────────────────────────────────
 
     def _browse_folder(self):
-        initial = self.BACKUP_PATHS.get(platform.system(), "")
+        initial = next(
+            (p for p in self.BACKUP_PATHS.get(platform.system(), [])
+             if os.path.isdir(p)), None
+        )
         path = filedialog.askdirectory(
             title="Select iPhone/iPad Backup Folder",
-            initialdir=initial if os.path.isdir(initial) else None,
+            initialdir=initial,
         )
         if path:
             self.path_var.set(path)
@@ -270,7 +733,8 @@ class BackupLens:
 
     def _decrypt(self):
         backup_dir = self.path_var.get().strip()
-        passphrase = self.pass_var.get().strip()
+        # Not stripped: a backup password may contain leading/trailing spaces.
+        passphrase = self.pass_var.get()
 
         if not backup_dir or not os.path.isdir(backup_dir):
             messagebox.showerror("Error", "Please select a valid backup folder.")
@@ -284,59 +748,29 @@ class BackupLens:
         self.status_var.set("Decrypting... this may take a moment.")
         self.root.update_idletasks()
 
-        threading.Thread(target=self._decrypt_thread,
-                          args=(backup_dir, passphrase), daemon=True).start()
+        future = self.session.open(backup_dir, passphrase)
+        self._when_done(
+            future, lambda fut: self._on_open_done(fut, passphrase)
+        )
 
-    def _query_manifest(self, callback, *args):
-        """Execute a callback with a manifest DB cursor (context-managed)."""
-        with self.backup.manifest_db_cursor() as cur:
-            return callback(cur, *args)
-
-    def _decrypt_thread(self, backup_dir, passphrase):
-        try:
-            from iphone_backup_decrypt import EncryptedBackup
-        except ImportError:
-            self.root.after(0, lambda: (
-                self.decrypt_btn.configure(state="normal"),
-                messagebox.showerror(
-                    "Missing Dependency",
-                    "The 'iphone_backup_decrypt' package is required.\n\n"
-                    "Install it by running:\n"
-                    "  pip install iphone_backup_decrypt",
-                ),
-                self.status_var.set("Missing dependency. See error above."),
-            ))
+    def _on_open_done(self, future, passphrase):
+        error = future.exception()
+        if error is not None:
+            self._on_decrypt_fail(error, passphrase)
             return
-
-        try:
-            self.backup = EncryptedBackup(
-                backup_directory=backup_dir, passphrase=passphrase
-            )
-            self.backup_dir = backup_dir
-            # Clear password from the UI after successful decryption
-            self.root.after(0, lambda: self.pass_var.set(""))
-
-            def load_initial(cur):
-                cur.execute(
-                    "SELECT DISTINCT domain FROM Files ORDER BY domain"
-                )
-                domains = [r[0] for r in cur.fetchall() if r[0]]
-                cur.execute("SELECT COUNT(*) FROM Files WHERE flags=1")
-                total = cur.fetchone()[0]
-                return domains, total
-
-            domains, total = self._query_manifest(load_initial)
-            self.root.after(0, self._on_decrypt_success, domains, total)
-
-        except Exception as e:
-            # Sanitize error message to avoid leaking password
-            err_msg = str(e)
-            if passphrase and passphrase in err_msg:
-                err_msg = err_msg.replace(passphrase, "****")
-            self.root.after(0, self._on_decrypt_fail, err_msg)
+        # Clear password from the UI after successful decryption
+        self.pass_var.set("")
+        domains, total = future.result()
+        self._on_decrypt_success(domains, total)
 
     def _on_decrypt_success(self, domains, total_files):
         self.decrypt_btn.configure(state="normal")
+        self.backup_open = True
+        self._scope_set = False
+        self._scope_domains = None
+        self._request_id += 1
+        self.file_tree.delete(*self.file_tree.get_children())
+        self.count_var.set("")
         self.status_var.set(
             f"Decrypted! {total_files:,} files across {len(domains)} domains."
         )
@@ -388,152 +822,110 @@ class BackupLens:
                 self.domain_tree.insert(cat_id, "end", iid=domain,
                                          text=domain)
 
-    def _on_decrypt_fail(self, error):
+    def _on_decrypt_fail(self, error, passphrase=""):
         self.decrypt_btn.configure(state="normal")
-        err_lower = error.lower()
-        if any(k in err_lower for k in ("password", "key", "decrypt")):
+        message = str(error) or type(error).__name__
+        # Never echo the password back in an error message.
+        if passphrase and len(passphrase) >= 4:
+            message = message.replace(passphrase, "****")
+
+        if isinstance(error, ImportError):
+            self.status_var.set("Missing dependency. See error above.")
+            messagebox.showerror(
+                "Missing Dependency",
+                "A required package could not be loaded:\n"
+                f"  {message}\n\n"
+                "Install the requirements by running:\n"
+                "  pip install -r requirements.txt",
+            )
+        elif is_wrong_passphrase(error):
             self.status_var.set("Incorrect password. Please try again.")
             messagebox.showerror(
                 "Decryption Failed",
                 "The password is incorrect. Please try again.\n\n"
                 "Tip: This is the password you set when enabling\n"
-                "encrypted backups in iTunes or Finder.",
+                "encrypted backups in iTunes or Finder. Check for\n"
+                "accidental leading or trailing spaces.",
             )
         else:
-            self.status_var.set(f"Error: {error}")
+            self.status_var.set(f"Error: {message}")
             messagebox.showerror("Error",
-                                  f"Failed to load backup:\n{error}")
+                                  f"Failed to load backup:\n{message}")
 
     # ── File loading ─────────────────────────────────────────
 
     def _on_domain_select(self, event):
         sel = self.domain_tree.selection()
-        if not sel or not self.backup:
+        if not sel or not self.backup_open:
             return
-        self.status_var.set("Loading files...")
-        self.root.update_idletasks()
-        threading.Thread(target=self._load_files, args=(sel[0],),
-                          daemon=True).start()
+        selected = sel[0]
+        if selected == "__ALL__":
+            self._scope_domains = None
+        elif selected.startswith("__CAT__"):
+            self._scope_domains = list(self.domain_tree.get_children(selected))
+        else:
+            self._scope_domains = [selected]
+        self._scope_set = True
+        self._refresh_files()
 
-    def _load_files(self, selected):
-        try:
-            if selected.startswith("__CAT__"):
-                self.root.after(0, self._load_category_files, selected)
-                return
-
-            def query(cur):
-                if selected == "__ALL__":
-                    cur.execute(
-                        "SELECT fileID, domain, relativePath, flags, file "
-                        "FROM Files WHERE flags=1 LIMIT 10000"
-                    )
-                else:
-                    cur.execute(
-                        "SELECT fileID, domain, relativePath, flags, file "
-                        "FROM Files WHERE domain=? AND flags=1 LIMIT 10000",
-                        (selected,),
-                    )
-                return cur.fetchall()
-
-            rows = self._query_manifest(query)
-            file_data = self._parse_file_rows(rows)
-            self.root.after(0, self._populate_files, file_data)
-
-        except Exception as e:
-            self.root.after(
-                0, lambda: self.status_var.set(f"Error loading: {e}")
-            )
-
-    def _load_category_files(self, cat_id):
-        children = self.domain_tree.get_children(cat_id)
-        if not children:
+    def _schedule_search(self):
+        """Re-query shortly after the user stops typing."""
+        if not self.backup_open:
             return
-        domains = list(children)
-        placeholders = ",".join("?" * len(domains))
-        threading.Thread(target=self._query_domains,
-                          args=(domains, placeholders), daemon=True).start()
+        if self._search_job is not None:
+            self.root.after_cancel(self._search_job)
+        self._search_job = self.root.after(300, self._refresh_files)
 
-    def _query_domains(self, domains, placeholders):
-        try:
-            def query(cur):
-                cur.execute(
-                    f"SELECT fileID, domain, relativePath, flags, file "
-                    f"FROM Files WHERE domain IN ({placeholders}) "
-                    f"AND flags=1 LIMIT 10000",
-                    domains,
-                )
-                return cur.fetchall()
+    def _refresh_files(self):
+        self._search_job = None
+        if not self.backup_open:
+            return
+        if not self._scope_set:
+            # Searching before choosing a category searches the whole backup.
+            self._scope_domains = None
+            self._scope_set = True
 
-            rows = self._query_manifest(query)
-            file_data = self._parse_file_rows(rows)
-            self.root.after(0, self._populate_files, file_data)
-        except Exception as e:
-            self.root.after(
-                0, lambda: self.status_var.set(f"Error: {e}")
+        self._request_id += 1
+        request_id = self._request_id
+        self.status_var.set(
+            "Waiting for the running extraction to finish..."
+            if self._extracting else "Loading files..."
+        )
+        future = self.session.query_files(
+            self._scope_domains, self.search_var.get().strip(), MAX_ROWS
+        )
+        self._when_done(
+            future, lambda fut: self._on_files_loaded(fut, request_id)
+        )
+
+    def _on_files_loaded(self, future, request_id):
+        if request_id != self._request_id:
+            return  # a newer selection or search superseded this one
+        error = future.exception()
+        if error is not None:
+            self.status_var.set(
+                f"Error loading: {str(error) or type(error).__name__}"
             )
+            return
+        rows, total = future.result()
+        self._populate_files(rows, total)
 
-    def _parse_file_rows(self, rows):
-        """Parse raw DB rows into display-friendly tuples."""
-        file_data = []
-        for row in rows:
-            file_id, domain, rel_path, flags, file_blob = row
-            size_str = ""
-            mod_str = ""
-            if file_blob:
-                try:
-                    meta = plistlib.loads(file_blob)
-                    objects = meta.get("$objects", [])
-                    if isinstance(objects, list) and len(objects) > 1:
-                        obj1 = objects[1]
-                        if isinstance(obj1, dict):
-                            size = obj1.get("Size", 0)
-                            if size:
-                                size_str = self._format_size(size)
-                    for obj in (objects if isinstance(objects, list) else []):
-                        if isinstance(obj, dict) and "LastModified" in obj:
-                            mod_str = datetime.fromtimestamp(
-                                obj["LastModified"]
-                            ).strftime("%Y-%m-%d %H:%M")
-                            break
-                except Exception:
-                    pass
-            file_data.append(
-                (file_id, domain, rel_path or "", size_str, mod_str)
-            )
-        return file_data
-
-    def _populate_files(self, file_data):
+    def _populate_files(self, rows, total):
         self.file_tree.delete(*self.file_tree.get_children())
-        self.file_list = file_data
-
-        seen_ids = set()
-        for fd in file_data:
-            file_id, domain, rel_path, size_str, mod_str = fd
-            # Avoid duplicate iid crash
-            uid = file_id
-            if uid in seen_ids:
-                uid = f"{file_id}_{domain}_{rel_path}"
-            seen_ids.add(uid)
-            self.file_tree.insert("", "end", iid=uid,
+        for file_id, domain, rel_path, size_str, mod_str in rows:
+            self.file_tree.insert("", "end", iid=file_id,
                                    values=(domain, rel_path, size_str, mod_str))
 
-        self.count_var.set(f"{len(file_data):,} files")
-        self.status_var.set(f"Loaded {len(file_data):,} files.")
-
-    def _filter_files(self):
-        query = self.search_var.get().lower().strip()
-        self.file_tree.delete(*self.file_tree.get_children())
-
-        count = 0
-        for fd in self.file_list:
-            file_id, domain, rel_path, size_str, mod_str = fd
-            if query in domain.lower() or query in rel_path.lower():
-                self.file_tree.insert("", "end", iid=file_id,
-                                       values=(domain, rel_path, size_str,
-                                               mod_str))
-                count += 1
-
-        self.count_var.set(f"{count:,} files")
+        if total > len(rows):
+            self.count_var.set(f"{len(rows):,} of {total:,} files")
+            self.status_var.set(
+                f"Showing the first {len(rows):,} of {total:,} matching "
+                "files. Narrow the category or use the search box to "
+                "see the rest."
+            )
+        else:
+            self.count_var.set(f"{len(rows):,} files")
+            self.status_var.set(f"Loaded {len(rows):,} files.")
 
     # ── Extraction ───────────────────────────────────────────
 
@@ -557,78 +949,70 @@ class BackupLens:
         self._extract_files(items)
 
     def _extract_files(self, file_ids):
+        if self._extracting:
+            messagebox.showinfo("Info", "An extraction is already running.")
+            return
         dest = filedialog.askdirectory(title="Select Output Folder")
         if not dest:
             return
+        self._extracting = True
         self.status_var.set(f"Extracting {len(file_ids)} files...")
         self.root.update_idletasks()
-        threading.Thread(target=self._extract_thread,
-                          args=(file_ids, dest), daemon=True).start()
 
-    def _extract_thread(self, file_ids, dest):
-        extracted = 0
-        errors = 0
-        skipped = 0
-        real_dest = os.path.realpath(dest)
+        def progress(done, total):
+            self._post(self._show_progress, done, total)
 
-        # Build lookup dict for O(1) access
-        lookup = {fd[0]: fd for fd in self.file_list}
+        future = self.session.extract(file_ids, dest, progress)
+        self._when_done(future, lambda fut: self._on_extract_done(fut, dest))
 
-        for fid in file_ids:
-            try:
-                info = lookup.get(fid)
-                if not info:
-                    errors += 1
-                    continue
+    def _show_progress(self, done, total):
+        if self._extracting:
+            self.status_var.set(f"Extracting... {done:,} of {total:,} files")
 
-                file_id, domain, rel_path, _, _ = info
-                if not rel_path:
-                    skipped += 1
-                    continue
+    def _on_extract_done(self, future, dest):
+        self._extracting = False
+        error = future.exception()
+        if error is not None:
+            msg = f"Extraction failed: {str(error) or type(error).__name__}"
+            self.status_var.set(msg)
+            messagebox.showerror("Error", msg)
+            return
 
-                out_path = os.path.join(dest, domain, rel_path)
+        report = future.result()
+        msg = f"Extracted {report.extracted:,} files to {dest}"
+        if report.errors:
+            msg += f" ({len(report.errors)} errors)"
+        if report.skipped:
+            msg += f" ({len(report.skipped)} skipped)"
+        if report.cancelled:
+            msg += " (cancelled)"
+        self.status_var.set(msg)
 
-                # Path traversal protection — ensure output stays inside dest
-                real_out = os.path.realpath(out_path)
-                if not real_out.startswith(real_dest + os.sep):
-                    skipped += 1
-                    continue
+        problems = [f"{label}: {reason}"
+                    for label, reason in report.errors + report.skipped]
+        if problems:
+            shown = "\n".join(problems[:10])
+            more = len(problems) - 10
+            if more > 0:
+                shown += f"\n...and {more} more"
+            messagebox.showwarning("Done, with problems",
+                                    f"{msg}\n\n{shown}")
+        else:
+            messagebox.showinfo("Done", msg)
 
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # ── Shutdown ─────────────────────────────────────────────
 
-                try:
-                    self.backup.extract_file(
-                        relative_path=rel_path, domain=domain,
-                        output_filename=out_path,
-                    )
-                    extracted += 1
-                except Exception:
-                    src = os.path.join(self.backup_dir, file_id[:2], file_id)
-                    if os.path.exists(src):
-                        shutil.copy2(src, out_path)
-                        extracted += 1
-                    else:
-                        errors += 1
-            except Exception:
-                errors += 1
-
-        msg = f"Extracted {extracted:,} files to {dest}"
-        if errors:
-            msg += f" ({errors} errors)"
-        if skipped:
-            msg += f" ({skipped} skipped)"
-        self.root.after(0, lambda: self.status_var.set(msg))
-        self.root.after(0, lambda: messagebox.showinfo("Done", msg))
-
-    # ── Helpers ──────────────────────────────────────────────
-
-    @staticmethod
-    def _format_size(size):
-        for unit in ("B", "KB", "MB"):
-            if size < 1024:
-                return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
-            size /= 1024
-        return f"{size:.2f} GB"
+    def _on_close(self):
+        if self._extracting and not messagebox.askyesno(
+            "Extraction running", "An extraction is still running. Quit anyway?"
+        ):
+            return
+        if self._poll_job is not None:
+            self.root.after_cancel(self._poll_job)
+        if self._search_job is not None:
+            self.root.after_cancel(self._search_job)
+        self.session.close()
+        self.root.destroy()
 
 
 def main():
