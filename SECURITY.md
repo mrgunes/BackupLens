@@ -35,6 +35,10 @@ The password you enter into BackupLens is the **encryption password you set in i
   - **Windows:** The password is not stored in Windows Credential Manager by default
 - BackupLens cannot recover or bypass your password. This is by design — it means no one else can either.
 
+## Unencrypted Backups
+
+Unencrypted backups need no password, so none is asked for or used. They are opened read-only (the backup folder is never written to, and no temporary copy of its index is made), and extracted files are copied out as they are.
+
 ## Supported Backup Sources
 
 BackupLens only reads **local iPhone/iPad backups** created by:
